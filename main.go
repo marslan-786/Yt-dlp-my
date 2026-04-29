@@ -31,13 +31,13 @@ type APIResponse struct {
 	VideoID string        `json:"video_id,omitempty"`
 	Formats []VideoFormat `json:"formats,omitempty"`
 	Message string        `json:"message,omitempty"`
-	RawData string        `json:"raw_data,omitempty"` // ---> NEW: For debugging YouTube's raw response
+	RawData string        `json:"raw_data,omitempty"`
 }
 
 // Global raw cookie string
 var rawCookieHeader string
 
-// Load cookies from JSON file at startup and build a raw string
+// Load cookies from JSON file
 func loadCookies(filename string) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -54,18 +54,26 @@ func loadCookies(filename string) {
 	}
 
 	var parts []string
+	hasConsent := false
+
 	for _, c := range rawCookies {
-		// Go ki strictness se bachne ke liye double quotes aur newlines remove kar rahe hain
-		cleanValue := strings.ReplaceAll(c.Value, "\"", "")
-		cleanValue = strings.ReplaceAll(cleanValue, "\n", "")
+		// Sirf newlines (\n) remove kar rahe hain, double quotes (") wese hi rahenge
+		cleanValue := strings.ReplaceAll(c.Value, "\n", "")
 		cleanValue = strings.ReplaceAll(cleanValue, "\r", "")
-		
 		parts = append(parts, fmt.Sprintf("%s=%s", c.Name, cleanValue))
+		
+		if strings.ToUpper(c.Name) == "CONSENT" {
+			hasConsent = true
+		}
 	}
 	
-	// Create a single raw cookie string format: "name1=value1; name2=value2"
+	// Agar CONSENT cookie nahi hai, to auto add kar do taake Youtube terms popup na de
+	if !hasConsent {
+		parts = append(parts, "CONSENT=YES+cb.20210328-17-p0.en+FX+478")
+	}
+	
 	rawCookieHeader = strings.Join(parts, "; ")
-	fmt.Printf("🍪 Loaded %d Cookies Successfully (Raw String Mode)!\n", len(rawCookies))
+	fmt.Printf("🍪 Loaded %d Cookies Successfully (Strict JSON Preserved)!\n", len(rawCookies))
 }
 
 // Extract Video ID from YouTube URL
@@ -79,14 +87,13 @@ func extractVideoID(url string) string {
 		idPart := strings.Split(parts[1], "?")[0]
 		return idPart
 	}
-	return url // Assume it's already an ID if no match
+	return url 
 }
 
 // Main API Handler
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	// Get URL from query parameters (e.g., ?url=https://youtu.be/...)
 	videoURL := r.URL.Query().Get("url")
 	if videoURL == "" {
 		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "URL parameter is missing"})
@@ -96,7 +103,6 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	videoID := extractVideoID(videoURL)
 	targetURL := "https://m.youtube.com/watch?v=" + videoID
 
-	// Create a fast HTTP client
 	client := &http.Client{Timeout: 15 * time.Second}
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
@@ -110,12 +116,11 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	req.Header.Set("Sec-Ch-Ua-Platform", "\"Android\"")
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
 
-	// ---> INJECT RAW COOKIE HEADER DIRECTLY <---
+	// Inject 100% accurate raw cookies
 	if rawCookieHeader != "" {
 		req.Header.Set("Cookie", rawCookieHeader)
 	}
 
-	// Send Request
 	resp, err := client.Do(req)
 	if err != nil {
 		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Failed to fetch video page"})
@@ -130,27 +135,33 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	bodyString := string(bodyBytes)
 
-	// Regex to find the internal JSON data
-	re := regexp.MustCompile(`ytInitialPlayerResponse\s*=\s*({.+?});var`)
-	match := re.FindStringSubmatch(bodyString)
-	if len(match) < 2 {
-		// Agar regex fail ho jaye, to poori HTML bhej do taake pata chale YT ne kya bheja
+	// Check if Google redirected us to a cookie error page
+	if strings.Contains(bodyString, "problem with your cookie settings") {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
-			Message: "Video JSON data not found in HTML. Checking raw_data field for YouTube's HTML response.",
-			RawData: bodyString,
+			Message: "Google rejected the cookies. They might be expired or invalid.",
 		})
 		return
 	}
 
-	// Parse the massive JSON blob
+	// Regex to find the internal JSON data
+	re := regexp.MustCompile(`ytInitialPlayerResponse\s*=\s*({.+?});var`)
+	match := re.FindStringSubmatch(bodyString)
+	if len(match) < 2 {
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  "error", 
+			Message: "Video JSON data not found in HTML. Check raw_data.",
+			RawData: bodyString, 
+		})
+		return
+	}
+
 	var playerData map[string]interface{}
 	err = json.Unmarshal([]byte(match[1]), &playerData)
 	if err != nil {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
-			Message: "Failed to parse YouTube's JSON data. Check raw_data.",
-			RawData: match[1],
+			Message: "Failed to parse YouTube's JSON data.",
 		})
 		return
 	}
@@ -163,7 +174,6 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
 			Message: "Playability Error: " + reason,
-			RawData: match[1], // Sending raw JSON to see exact playability restriction
 		})
 		return
 	}
@@ -173,15 +183,13 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
-			Message: "No streamingData object found. Check raw_data.",
-			RawData: match[1], // Yahan se structure dekh sakte ho
+			Message: "No streamingData object found.",
 		})
 		return
 	}
 
 	var extractedFormats []VideoFormat
 
-	// Helper function to process formats
 	processFormatList := func(formatList interface{}) {
 		formats, ok := formatList.([]interface{})
 		if !ok {
@@ -195,7 +203,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 			
 			quality, _ := fmtData["qualityLabel"].(string)
 			if quality == "" {
-				quality = "Audio Only / Unknown"
+				quality = "Audio Only"
 			}
 			mime, _ := fmtData["mimeType"].(string)
 			url, _ := fmtData["url"].(string)
@@ -210,15 +218,13 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Parse both combined formats and adaptive formats
 	processFormatList(streamingData["formats"])
 	processFormatList(streamingData["adaptiveFormats"])
 
 	if len(extractedFormats) == 0 {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
-			Message: "Could not find direct URLs. Video might be using Cipher protection. Check raw_data.",
-			RawData: match[1], // YT JSON for cipher debugging
+			Message: "Could not find direct URLs. Video might be using Cipher protection.",
 		})
 		return
 	}
