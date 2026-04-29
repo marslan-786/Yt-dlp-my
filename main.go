@@ -57,7 +57,7 @@ func loadCookies(filename string) {
 	hasConsent := false
 
 	for _, c := range rawCookies {
-		// Sirf newlines (\n) remove kar rahe hain, double quotes (") wese hi rahenge
+		// Newlines remove kar rahe hain magar double quotes (") ko mehfooz rakha hai
 		cleanValue := strings.ReplaceAll(c.Value, "\n", "")
 		cleanValue = strings.ReplaceAll(cleanValue, "\r", "")
 		parts = append(parts, fmt.Sprintf("%s=%s", c.Name, cleanValue))
@@ -67,13 +67,13 @@ func loadCookies(filename string) {
 		}
 	}
 	
-	// Agar CONSENT cookie nahi hai, to auto add kar do taake Youtube terms popup na de
+	// CONSENT cookie auto-add taake Youtube terms wala page bypass ho
 	if !hasConsent {
 		parts = append(parts, "CONSENT=YES+cb.20210328-17-p0.en+FX+478")
 	}
 	
 	rawCookieHeader = strings.Join(parts, "; ")
-	fmt.Printf("🍪 Loaded %d Cookies Successfully (Strict JSON Preserved)!\n", len(rawCookies))
+	fmt.Printf("🍪 Loaded %d Cookies Successfully!\n", len(rawCookies))
 }
 
 // Extract Video ID from YouTube URL
@@ -110,13 +110,12 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ---> STRICT ANDROID HEADERS <---
+	// STRICT ANDROID HEADERS
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Sec-Ch-Ua-Platform", "\"Android\"")
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
 
-	// Inject 100% accurate raw cookies
 	if rawCookieHeader != "" {
 		req.Header.Set("Cookie", rawCookieHeader)
 	}
@@ -135,22 +134,23 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	bodyString := string(bodyBytes)
 
-	// Check if Google redirected us to a cookie error page
+	// ---> FIXED: Ab cookie error ane par bhi raw_data bhejega <---
 	if strings.Contains(bodyString, "problem with your cookie settings") {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
-			Message: "Google rejected the cookies. They might be expired or invalid.",
+			Message: "Google rejected the cookies. Full HTML response in raw_data.",
+			RawData: bodyString, // User ab yahan se dekh sakega ke Google ne kya bheja
 		})
 		return
 	}
 
-	// Regex to find the internal JSON data
+	// Regex for internal JSON data
 	re := regexp.MustCompile(`ytInitialPlayerResponse\s*=\s*({.+?});var`)
 	match := re.FindStringSubmatch(bodyString)
 	if len(match) < 2 {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
-			Message: "Video JSON data not found in HTML. Check raw_data.",
+			Message: "Video JSON data not found in HTML. Check raw_data for full HTML.",
 			RawData: bodyString, 
 		})
 		return
@@ -161,12 +161,13 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
-			Message: "Failed to parse YouTube's JSON data.",
+			Message: "Failed to parse YouTube's JSON data. Raw JSON in raw_data.",
+			RawData: match[1],
 		})
 		return
 	}
 
-	// Check Playability Status
+	// Check Playability
 	playability, _ := playerData["playabilityStatus"].(map[string]interface{})
 	status, _ := playability["status"].(string)
 	if status != "OK" {
@@ -174,6 +175,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
 			Message: "Playability Error: " + reason,
+			RawData: match[1],
 		})
 		return
 	}
@@ -184,6 +186,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
 			Message: "No streamingData object found.",
+			RawData: match[1],
 		})
 		return
 	}
@@ -192,19 +195,13 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	processFormatList := func(formatList interface{}) {
 		formats, ok := formatList.([]interface{})
-		if !ok {
-			return
-		}
+		if !ok { return }
 		for _, f := range formats {
 			fmtData, ok := f.(map[string]interface{})
-			if !ok {
-				continue
-			}
+			if !ok { continue }
 			
 			quality, _ := fmtData["qualityLabel"].(string)
-			if quality == "" {
-				quality = "Audio Only"
-			}
+			if quality == "" { quality = "Audio Only" }
 			mime, _ := fmtData["mimeType"].(string)
 			url, _ := fmtData["url"].(string)
 
@@ -224,12 +221,13 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	if len(extractedFormats) == 0 {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
-			Message: "Could not find direct URLs. Video might be using Cipher protection.",
+			Message: "Could not find direct URLs. Check raw_data for cipher check.",
+			RawData: match[1],
 		})
 		return
 	}
 
-	// Send Success Response
+	// Final Success
 	json.NewEncoder(w).Encode(APIResponse{
 		Status:  "success",
 		VideoID: videoID,
@@ -243,9 +241,7 @@ func main() {
 	http.HandleFunc("/api/download", downloadHandler)
 
 	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
+	if port == "" { port = "8080" }
 
 	fmt.Println("🚀 Go API Server running on port", port)
 	err := http.ListenAndServe(":"+port, nil)
