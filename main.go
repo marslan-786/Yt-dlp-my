@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -19,7 +20,6 @@ type CookieJSON struct {
 	Path   string `json:"path"`
 }
 
-// --- Response Structs ---
 type VideoFormat struct {
 	Quality  string `json:"quality"`
 	MimeType string `json:"mimeType"`
@@ -34,7 +34,6 @@ type APIResponse struct {
 	RawData string        `json:"raw_data,omitempty"`
 }
 
-// Global raw cookie string
 var rawCookieHeader string
 
 // Load cookies from JSON file
@@ -47,59 +46,87 @@ func loadCookies(filename string) {
 	defer file.Close()
 
 	var rawCookies []CookieJSON
-	err = json.NewDecoder(file).Decode(&rawCookies)
-	if err != nil {
-		fmt.Println("⚠️ Error decoding cookies:", err)
-		return
-	}
+	json.NewDecoder(file).Decode(&rawCookies)
 
 	var parts []string
 	hasConsent := false
 	youtubeCookiesCount := 0
 
 	for _, c := range rawCookies {
-		// ---> THE MAGIC FIX: FILTER GARBAGE COOKIES <---
 		if !strings.Contains(c.Domain, "youtube.com") {
 			continue
 		}
-
-		// Newlines remove kar rahe hain magar double quotes (") ko mehfooz rakha hai
 		cleanValue := strings.ReplaceAll(c.Value, "\n", "")
 		cleanValue = strings.ReplaceAll(cleanValue, "\r", "")
 		parts = append(parts, fmt.Sprintf("%s=%s", c.Name, cleanValue))
-		
 		youtubeCookiesCount++
-
 		if strings.ToUpper(c.Name) == "CONSENT" {
 			hasConsent = true
 		}
 	}
 	
-	// CONSENT cookie auto-add taake Youtube terms wala page bypass ho
 	if !hasConsent {
 		parts = append(parts, "CONSENT=YES+cb.20210328-17-p0.en+FX+478")
 		youtubeCookiesCount++
 	}
 	
 	rawCookieHeader = strings.Join(parts, "; ")
-	fmt.Printf("🍪 Filtered and Loaded %d STRICTLY YouTube Cookies Successfully out of %d!\n", youtubeCookiesCount, len(rawCookies))
+	fmt.Printf("🍪 Filtered and Loaded %d STRICTLY YouTube Cookies!\n", youtubeCookiesCount)
 }
 
-// Extract Video ID from YouTube URL
 func extractVideoID(url string) string {
 	if strings.Contains(url, "v=") {
-		parts := strings.Split(url, "v=")
-		idPart := strings.Split(parts[1], "&")[0]
-		return idPart
+		return strings.Split(strings.Split(url, "v=")[1], "&")[0]
 	} else if strings.Contains(url, "youtu.be/") {
-		parts := strings.Split(url, "youtu.be/")
-		idPart := strings.Split(parts[1], "?")[0]
-		return idPart
+		return strings.Split(strings.Split(url, "youtu.be/")[1], "?")[0]
 	}
 	return url 
 }
 
-// Main API Handler
+// ---> 1. THE PROXY STREAMER (THE MAGIC FIX) <---
+// Ye function IP Block wale masle ko khatam karega!
+func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	targetURL := r.URL.Query().Get("link")
+	if targetURL == "" {
+		http.Error(w, "Link parameter missing", http.StatusBadRequest)
+		return
+	}
+
+	// Create request to the actual googlevideo.com link
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
+		return
+	}
+
+	// Pass necessary headers to act like a real browser downloading the file
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Referer", "https://www.youtube.com/")
+	
+	// Agar user ne partial video mangi hai (Seeking / Resuming), to Range header pass karo
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "Proxy fetch failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy important headers from YouTube back to the User (MP4 Type, Size, etc.)
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	// Stream the video directly to the user like a pipe (0% RAM usage on server)
+	io.Copy(w, resp.Body)
+}
+
+// ---> 2. MAIN DOWNLOAD HANDLER <---
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -119,13 +146,11 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// STRICT ANDROID HEADERS
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Sec-Ch-Ua-Platform", "\"Android\"")
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
 
-	// Inject 100% accurate raw cookies without Go's strict formatting errors
 	if rawCookieHeader != "" {
 		req.Header.Set("Cookie", rawCookieHeader)
 	}
@@ -137,70 +162,40 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Failed to read response"})
-		return
-	}
+	bodyBytes, _ := io.ReadAll(resp.Body)
 	bodyString := string(bodyBytes)
 
 	if strings.Contains(bodyString, "problem with your cookie settings") {
-		json.NewEncoder(w).Encode(APIResponse{
-			Status:  "error", 
-			Message: "Google rejected the cookies. They might be expired or invalid.",
-			RawData: bodyString, 
-		})
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Google rejected the cookies."})
 		return
 	}
 
-	// ---> NEW SMART REGEX FOR i.html STYLE RESPONSE <---
 	re := regexp.MustCompile(`(?s)ytInitialPlayerResponse\s*=\s*(\{.+?\});(?:var\s|</script>)`)
 	match := re.FindStringSubmatch(bodyString)
 	if len(match) < 2 {
-		json.NewEncoder(w).Encode(APIResponse{
-			Status:  "error", 
-			Message: "Video JSON data not found in HTML. Check raw_data for full HTML.",
-			RawData: bodyString, 
-		})
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Video JSON data not found in HTML."})
 		return
 	}
 
 	var playerData map[string]interface{}
-	err = json.Unmarshal([]byte(match[1]), &playerData)
-	if err != nil {
-		json.NewEncoder(w).Encode(APIResponse{
-			Status:  "error", 
-			Message: "Failed to parse YouTube's JSON data. Raw JSON in raw_data.",
-			RawData: match[1],
-		})
-		return
-	}
+	json.Unmarshal([]byte(match[1]), &playerData)
 
-	// Check Playability
 	playability, _ := playerData["playabilityStatus"].(map[string]interface{})
 	status, _ := playability["status"].(string)
 	if status != "OK" {
 		reason, _ := playability["reason"].(string)
-		json.NewEncoder(w).Encode(APIResponse{
-			Status:  "error", 
-			Message: "Playability Error: " + reason,
-			RawData: match[1],
-		})
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Playability Error: " + reason})
 		return
 	}
 
-	// Extract Streaming Data
 	streamingData, ok := playerData["streamingData"].(map[string]interface{})
 	if !ok {
-		json.NewEncoder(w).Encode(APIResponse{
-			Status:  "error", 
-			Message: "No streamingData object found.",
-			RawData: match[1],
-		})
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "No streamingData object found."})
 		return
 	}
 
 	var extractedFormats []VideoFormat
+	host := r.Host // Get your server's domain/IP
 
 	processFormatList := func(formatList interface{}) {
 		formats, ok := formatList.([]interface{})
@@ -212,13 +207,17 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 			quality, _ := fmtData["qualityLabel"].(string)
 			if quality == "" { quality = "Audio Only" }
 			mime, _ := fmtData["mimeType"].(string)
-			url, _ := fmtData["url"].(string)
+			ytDirectUrl, _ := fmtData["url"].(string)
 
-			if url != "" {
+			if ytDirectUrl != "" {
+				// ---> REPLACE GOOGLE URL WITH OUR PROXY URL <---
+				// User ko apna API link do taake IP block na ho
+				proxiedUrl := fmt.Sprintf("http://%s/proxy?link=%s", host, url.QueryEscape(ytDirectUrl))
+
 				extractedFormats = append(extractedFormats, VideoFormat{
 					Quality:  quality,
 					MimeType: strings.Split(mime, ";")[0],
-					URL:      url,
+					URL:      proxiedUrl, 
 				})
 			}
 		}
@@ -228,15 +227,10 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	processFormatList(streamingData["adaptiveFormats"])
 
 	if len(extractedFormats) == 0 {
-		json.NewEncoder(w).Encode(APIResponse{
-			Status:  "error", 
-			Message: "Could not find direct URLs. Video might be using Cipher protection. Check raw_data for cipher check.",
-			RawData: match[1],
-		})
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Could not find direct URLs."})
 		return
 	}
 
-	// Final Success
 	json.NewEncoder(w).Encode(APIResponse{
 		Status:  "success",
 		VideoID: videoID,
@@ -248,13 +242,11 @@ func main() {
 	loadCookies("youtube_cookies.json")
 
 	http.HandleFunc("/api/download", downloadHandler)
+	http.HandleFunc("/proxy", proxyHandler) // <-- NEW PROXY ROUTE ENABLED
 
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }
 
 	fmt.Println("🚀 Go API Server running on port", port)
-	err := http.ListenAndServe(":"+port, nil)
-	if err != nil {
-		fmt.Println("Server Error:", err)
-	}
+	http.ListenAndServe(":"+port, nil)
 }
