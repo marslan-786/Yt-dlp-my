@@ -65,7 +65,7 @@ func loadCookies(filename string) {
 
 		// Newlines remove kar rahe hain magar double quotes (") ko mehfooz rakha hai
 		cleanValue := strings.ReplaceAll(c.Value, "\n", "")
-		cleanValue := strings.ReplaceAll(cleanValue, "\r", "")
+		cleanValue = strings.ReplaceAll(cleanValue, "\r", "")
 		parts = append(parts, fmt.Sprintf("%s=%s", c.Name, cleanValue))
 		
 		youtubeCookiesCount++
