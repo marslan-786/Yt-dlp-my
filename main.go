@@ -31,12 +31,13 @@ type APIResponse struct {
 	VideoID string        `json:"video_id,omitempty"`
 	Formats []VideoFormat `json:"formats,omitempty"`
 	Message string        `json:"message,omitempty"`
+	RawData string        `json:"raw_data,omitempty"` // ---> NEW: For debugging YouTube's raw response
 }
 
-// Global cookies slice
-var ytCookies []*http.Cookie
+// Global raw cookie string
+var rawCookieHeader string
 
-// Load cookies from JSON file at startup
+// Load cookies from JSON file at startup and build a raw string
 func loadCookies(filename string) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -52,15 +53,19 @@ func loadCookies(filename string) {
 		return
 	}
 
+	var parts []string
 	for _, c := range rawCookies {
-		ytCookies = append(ytCookies, &http.Cookie{
-			Name:   c.Name,
-			Value:  c.Value,
-			Domain: c.Domain,
-			Path:   c.Path,
-		})
+		// Go ki strictness se bachne ke liye double quotes aur newlines remove kar rahe hain
+		cleanValue := strings.ReplaceAll(c.Value, "\"", "")
+		cleanValue = strings.ReplaceAll(cleanValue, "\n", "")
+		cleanValue = strings.ReplaceAll(cleanValue, "\r", "")
+		
+		parts = append(parts, fmt.Sprintf("%s=%s", c.Name, cleanValue))
 	}
-	fmt.Printf("🍪 Loaded %d Cookies Successfully!\n", len(ytCookies))
+	
+	// Create a single raw cookie string format: "name1=value1; name2=value2"
+	rawCookieHeader = strings.Join(parts, "; ")
+	fmt.Printf("🍪 Loaded %d Cookies Successfully (Raw String Mode)!\n", len(rawCookies))
 }
 
 // Extract Video ID from YouTube URL
@@ -92,7 +97,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	targetURL := "https://m.youtube.com/watch?v=" + videoID
 
 	// Create a fast HTTP client
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 15 * time.Second}
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Failed to create request"})
@@ -105,9 +110,9 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	req.Header.Set("Sec-Ch-Ua-Platform", "\"Android\"")
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
 
-	// Inject Cookies
-	for _, cookie := range ytCookies {
-		req.AddCookie(cookie)
+	// ---> INJECT RAW COOKIE HEADER DIRECTLY <---
+	if rawCookieHeader != "" {
+		req.Header.Set("Cookie", rawCookieHeader)
 	}
 
 	// Send Request
@@ -129,7 +134,12 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	re := regexp.MustCompile(`ytInitialPlayerResponse\s*=\s*({.+?});var`)
 	match := re.FindStringSubmatch(bodyString)
 	if len(match) < 2 {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Video data not found. Might be blocked or private."})
+		// Agar regex fail ho jaye, to poori HTML bhej do taake pata chale YT ne kya bheja
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  "error", 
+			Message: "Video JSON data not found in HTML. Checking raw_data field for YouTube's HTML response.",
+			RawData: bodyString,
+		})
 		return
 	}
 
@@ -137,7 +147,11 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	var playerData map[string]interface{}
 	err = json.Unmarshal([]byte(match[1]), &playerData)
 	if err != nil {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Failed to parse JSON data"})
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  "error", 
+			Message: "Failed to parse YouTube's JSON data. Check raw_data.",
+			RawData: match[1],
+		})
 		return
 	}
 
@@ -146,14 +160,22 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	status, _ := playability["status"].(string)
 	if status != "OK" {
 		reason, _ := playability["reason"].(string)
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Playability Error: " + reason})
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  "error", 
+			Message: "Playability Error: " + reason,
+			RawData: match[1], // Sending raw JSON to see exact playability restriction
+		})
 		return
 	}
 
 	// Extract Streaming Data
 	streamingData, ok := playerData["streamingData"].(map[string]interface{})
 	if !ok {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "No streaming data found"})
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  "error", 
+			Message: "No streamingData object found. Check raw_data.",
+			RawData: match[1], // Yahan se structure dekh sakte ho
+		})
 		return
 	}
 
@@ -178,7 +200,6 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 			mime, _ := fmtData["mimeType"].(string)
 			url, _ := fmtData["url"].(string)
 
-			// If URL is present, add it. (Note: Encrypted signatures have 'signatureCipher' instead of 'url')
 			if url != "" {
 				extractedFormats = append(extractedFormats, VideoFormat{
 					Quality:  quality,
@@ -189,12 +210,16 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Parse both combined formats and adaptive formats (separate audio/video)
+	// Parse both combined formats and adaptive formats
 	processFormatList(streamingData["formats"])
 	processFormatList(streamingData["adaptiveFormats"])
 
 	if len(extractedFormats) == 0 {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Could not find direct URLs. Video might have Cipher protection."})
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  "error", 
+			Message: "Could not find direct URLs. Video might be using Cipher protection. Check raw_data.",
+			RawData: match[1], // YT JSON for cipher debugging
+		})
 		return
 	}
 
@@ -207,7 +232,6 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// Startup: Load Cookies
 	loadCookies("youtube_cookies.json")
 
 	http.HandleFunc("/api/download", downloadHandler)
