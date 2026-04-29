@@ -55,13 +55,21 @@ func loadCookies(filename string) {
 
 	var parts []string
 	hasConsent := false
+	youtubeCookiesCount := 0
 
 	for _, c := range rawCookies {
+		// ---> THE MAGIC FIX: FILTER GARBAGE COOKIES <---
+		if !strings.Contains(c.Domain, "youtube.com") {
+			continue
+		}
+
 		// Newlines remove kar rahe hain magar double quotes (") ko mehfooz rakha hai
 		cleanValue := strings.ReplaceAll(c.Value, "\n", "")
-		cleanValue = strings.ReplaceAll(cleanValue, "\r", "")
+		cleanValue := strings.ReplaceAll(cleanValue, "\r", "")
 		parts = append(parts, fmt.Sprintf("%s=%s", c.Name, cleanValue))
 		
+		youtubeCookiesCount++
+
 		if strings.ToUpper(c.Name) == "CONSENT" {
 			hasConsent = true
 		}
@@ -70,10 +78,11 @@ func loadCookies(filename string) {
 	// CONSENT cookie auto-add taake Youtube terms wala page bypass ho
 	if !hasConsent {
 		parts = append(parts, "CONSENT=YES+cb.20210328-17-p0.en+FX+478")
+		youtubeCookiesCount++
 	}
 	
 	rawCookieHeader = strings.Join(parts, "; ")
-	fmt.Printf("🍪 Loaded %d Cookies Successfully!\n", len(rawCookies))
+	fmt.Printf("🍪 Filtered and Loaded %d STRICTLY YouTube Cookies Successfully out of %d!\n", youtubeCookiesCount, len(rawCookies))
 }
 
 // Extract Video ID from YouTube URL
@@ -116,6 +125,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	req.Header.Set("Sec-Ch-Ua-Platform", "\"Android\"")
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
 
+	// Inject 100% accurate raw cookies without Go's strict formatting errors
 	if rawCookieHeader != "" {
 		req.Header.Set("Cookie", rawCookieHeader)
 	}
@@ -134,18 +144,17 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	bodyString := string(bodyBytes)
 
-	// ---> FIXED: Ab cookie error ane par bhi raw_data bhejega <---
 	if strings.Contains(bodyString, "problem with your cookie settings") {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
-			Message: "Google rejected the cookies. Full HTML response in raw_data.",
-			RawData: bodyString, // User ab yahan se dekh sakega ke Google ne kya bheja
+			Message: "Google rejected the cookies. They might be expired or invalid.",
+			RawData: bodyString, 
 		})
 		return
 	}
 
-	// Regex for internal JSON data
-	re := regexp.MustCompile(`ytInitialPlayerResponse\s*=\s*({.+?});var`)
+	// ---> NEW SMART REGEX FOR i.html STYLE RESPONSE <---
+	re := regexp.MustCompile(`(?s)ytInitialPlayerResponse\s*=\s*(\{.+?\});(?:var\s|</script>)`)
 	match := re.FindStringSubmatch(bodyString)
 	if len(match) < 2 {
 		json.NewEncoder(w).Encode(APIResponse{
@@ -221,7 +230,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	if len(extractedFormats) == 0 {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
-			Message: "Could not find direct URLs. Check raw_data for cipher check.",
+			Message: "Could not find direct URLs. Video might be using Cipher protection. Check raw_data for cipher check.",
 			RawData: match[1],
 		})
 		return
