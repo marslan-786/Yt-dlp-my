@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -20,6 +19,7 @@ type CookieJSON struct {
 	Path   string `json:"path"`
 }
 
+// --- Response Structs ---
 type VideoFormat struct {
 	Quality  string `json:"quality"`
 	MimeType string `json:"mimeType"`
@@ -27,13 +27,15 @@ type VideoFormat struct {
 }
 
 type APIResponse struct {
-	Status  string        `json:"status"`
-	VideoID string        `json:"video_id,omitempty"`
-	Formats []VideoFormat `json:"formats,omitempty"`
-	Message string        `json:"message,omitempty"`
-	RawData string        `json:"raw_data,omitempty"`
+	Status        string        `json:"status"`
+	VideoID       string        `json:"video_id,omitempty"`
+	DownloadedURL string        `json:"downloaded_url,omitempty"` // ---> NEW: Server ka local link
+	Formats       []VideoFormat `json:"formats,omitempty"`
+	Message       string        `json:"message,omitempty"`
+	RawData       string        `json:"raw_data,omitempty"`
 }
 
+// Global raw cookie string
 var rawCookieHeader string
 
 // Load cookies from JSON file
@@ -46,7 +48,11 @@ func loadCookies(filename string) {
 	defer file.Close()
 
 	var rawCookies []CookieJSON
-	json.NewDecoder(file).Decode(&rawCookies)
+	err = json.NewDecoder(file).Decode(&rawCookies)
+	if err != nil {
+		fmt.Println("⚠️ Error decoding cookies:", err)
+		return
+	}
 
 	var parts []string
 	hasConsent := false
@@ -76,57 +82,16 @@ func loadCookies(filename string) {
 
 func extractVideoID(url string) string {
 	if strings.Contains(url, "v=") {
-		return strings.Split(strings.Split(url, "v=")[1], "&")[0]
+		parts := strings.Split(url, "v=")
+		return strings.Split(parts[1], "&")[0]
 	} else if strings.Contains(url, "youtu.be/") {
-		return strings.Split(strings.Split(url, "youtu.be/")[1], "?")[0]
+		parts := strings.Split(url, "youtu.be/")
+		return strings.Split(parts[1], "?")[0]
 	}
 	return url 
 }
 
-// ---> 1. THE PROXY STREAMER (THE MAGIC FIX) <---
-// Ye function IP Block wale masle ko khatam karega!
-func proxyHandler(w http.ResponseWriter, r *http.Request) {
-	targetURL := r.URL.Query().Get("link")
-	if targetURL == "" {
-		http.Error(w, "Link parameter missing", http.StatusBadRequest)
-		return
-	}
-
-	// Create request to the actual googlevideo.com link
-	req, err := http.NewRequest("GET", targetURL, nil)
-	if err != nil {
-		http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
-		return
-	}
-
-	// Pass necessary headers to act like a real browser downloading the file
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	req.Header.Set("Referer", "https://www.youtube.com/")
-	
-	// Agar user ne partial video mangi hai (Seeking / Resuming), to Range header pass karo
-	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
-		req.Header.Set("Range", rangeHeader)
-	}
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		http.Error(w, "Proxy fetch failed", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Copy important headers from YouTube back to the User (MP4 Type, Size, etc.)
-	for k, v := range resp.Header {
-		w.Header()[k] = v
-	}
-	w.WriteHeader(resp.StatusCode)
-
-	// Stream the video directly to the user like a pipe (0% RAM usage on server)
-	io.Copy(w, resp.Body)
-}
-
-// ---> 2. MAIN DOWNLOAD HANDLER <---
+// Main API Handler
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -162,18 +127,29 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Failed to read response"})
+		return
+	}
 	bodyString := string(bodyBytes)
 
 	if strings.Contains(bodyString, "problem with your cookie settings") {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Google rejected the cookies."})
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  "error", 
+			Message: "Google rejected the cookies.",
+			RawData: bodyString, 
+		})
 		return
 	}
 
 	re := regexp.MustCompile(`(?s)ytInitialPlayerResponse\s*=\s*(\{.+?\});(?:var\s|</script>)`)
 	match := re.FindStringSubmatch(bodyString)
 	if len(match) < 2 {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Video JSON data not found in HTML."})
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  "error", 
+			Message: "Video JSON data not found.",
+		})
 		return
 	}
 
@@ -184,7 +160,10 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	status, _ := playability["status"].(string)
 	if status != "OK" {
 		reason, _ := playability["reason"].(string)
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Playability Error: " + reason})
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  "error", 
+			Message: "Playability Error: " + reason,
+		})
 		return
 	}
 
@@ -195,9 +174,9 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var extractedFormats []VideoFormat
-	host := r.Host // Get your server's domain/IP
+	var targetDownloadURL string
 
-	processFormatList := func(formatList interface{}) {
+	processFormatList := func(formatList interface{}, isCombined bool) {
 		formats, ok := formatList.([]interface{})
 		if !ok { return }
 		for _, f := range formats {
@@ -207,46 +186,88 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 			quality, _ := fmtData["qualityLabel"].(string)
 			if quality == "" { quality = "Audio Only" }
 			mime, _ := fmtData["mimeType"].(string)
-			ytDirectUrl, _ := fmtData["url"].(string)
+			url, _ := fmtData["url"].(string)
 
-			if ytDirectUrl != "" {
-				// ---> REPLACE GOOGLE URL WITH OUR PROXY URL <---
-				// User ko apna API link do taake IP block na ho
-				proxiedUrl := fmt.Sprintf("http://%s/proxy?link=%s", host, url.QueryEscape(ytDirectUrl))
-
+			if url != "" {
 				extractedFormats = append(extractedFormats, VideoFormat{
 					Quality:  quality,
 					MimeType: strings.Split(mime, ";")[0],
-					URL:      proxiedUrl, 
+					URL:      url,
 				})
+				// Sab se choti combined video (jis me audio+video dono hon) download karne ke liye save kar lo
+				if isCombined && targetDownloadURL == "" {
+					targetDownloadURL = url
+				}
 			}
 		}
 	}
 
-	processFormatList(streamingData["formats"])
-	processFormatList(streamingData["adaptiveFormats"])
+	// Pehle 'formats' (combined audio/video) process karo, phir 'adaptive'
+	processFormatList(streamingData["formats"], true)
+	processFormatList(streamingData["adaptiveFormats"], false)
 
 	if len(extractedFormats) == 0 {
 		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Could not find direct URLs."})
 		return
 	}
 
+	// Agar combine format nahi mila to jo pehla link mile wahi utha lo
+	if targetDownloadURL == "" {
+		targetDownloadURL = extractedFormats[0].URL
+	}
+
+	// ---> START SERVER-SIDE DOWNLOADING <---
+	fmt.Println("⏳ Downloading smallest video chunk to server...")
+	os.MkdirAll("downloads", os.ModePerm) // Downloads folder create karega
+	fileName := videoID + ".mp4"
+	filePath := "downloads/" + fileName
+
+	dlReq, _ := http.NewRequest("GET", targetDownloadURL, nil)
+	dlReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	
+	dlClient := &http.Client{Timeout: 60 * time.Second} // Max 60 sec wait karega download ka
+	dlResp, err := dlClient.Do(dlReq)
+	
+	localDownloadURL := ""
+	if err == nil && dlResp.StatusCode == 200 {
+		defer dlResp.Body.Close()
+		outFile, err := os.Create(filePath)
+		if err == nil {
+			io.Copy(outFile, dlResp.Body)
+			outFile.Close()
+			fmt.Println("✅ Video downloaded successfully:", fileName)
+			// Local URL generate kar raha hai (e.g. http://localhost:8080/downloads/video_id.mp4)
+			localDownloadURL = fmt.Sprintf("http://%s/downloads/%s", r.Host, fileName)
+		}
+	} else {
+		fmt.Println("❌ Failed to download video to server.")
+	}
+	// ----------------------------------------
+
+	// Send Final Success Response
 	json.NewEncoder(w).Encode(APIResponse{
-		Status:  "success",
-		VideoID: videoID,
-		Formats: extractedFormats,
+		Status:        "success",
+		VideoID:       videoID,
+		DownloadedURL: localDownloadURL, // Seedha server ka direct link!
+		Formats:       extractedFormats,
 	})
 }
 
 func main() {
 	loadCookies("youtube_cookies.json")
 
+	// Routes
 	http.HandleFunc("/api/download", downloadHandler)
-	http.HandleFunc("/proxy", proxyHandler) // <-- NEW PROXY ROUTE ENABLED
+	
+	// Naya route banaya hai jo downloads folder ki files serve karega
+	http.Handle("/downloads/", http.StripPrefix("/downloads/", http.FileServer(http.Dir("downloads"))))
 
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }
 
 	fmt.Println("🚀 Go API Server running on port", port)
-	http.ListenAndServe(":"+port, nil)
+	err := http.ListenAndServe(":"+port, nil)
+	if err != nil {
+		fmt.Println("Server Error:", err)
+	}
 }
