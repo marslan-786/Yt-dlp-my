@@ -27,12 +27,11 @@ type VideoFormat struct {
 }
 
 type APIResponse struct {
-	Status        string        `json:"status"`
-	VideoID       string        `json:"video_id,omitempty"`
-	DownloadedURL string        `json:"downloaded_url,omitempty"` // ---> NEW: Server ka local link
-	Formats       []VideoFormat `json:"formats,omitempty"`
-	Message       string        `json:"message,omitempty"`
-	RawData       string        `json:"raw_data,omitempty"`
+	Status  string        `json:"status"`
+	VideoID string        `json:"video_id,omitempty"`
+	Formats []VideoFormat `json:"formats,omitempty"`
+	Message string        `json:"message,omitempty"`
+	RawData string        `json:"raw_data,omitempty"`
 }
 
 // Global raw cookie string
@@ -59,34 +58,43 @@ func loadCookies(filename string) {
 	youtubeCookiesCount := 0
 
 	for _, c := range rawCookies {
+		// ---> THE MAGIC FIX: FILTER GARBAGE COOKIES <---
 		if !strings.Contains(c.Domain, "youtube.com") {
 			continue
 		}
+
+		// Newlines remove kar rahe hain magar double quotes (") ko mehfooz rakha hai
 		cleanValue := strings.ReplaceAll(c.Value, "\n", "")
-		cleanValue = strings.ReplaceAll(cleanValue, "\r", "")
+		cleanValue := strings.ReplaceAll(cleanValue, "\r", "")
 		parts = append(parts, fmt.Sprintf("%s=%s", c.Name, cleanValue))
+		
 		youtubeCookiesCount++
+
 		if strings.ToUpper(c.Name) == "CONSENT" {
 			hasConsent = true
 		}
 	}
 	
+	// CONSENT cookie auto-add taake Youtube terms wala page bypass ho
 	if !hasConsent {
 		parts = append(parts, "CONSENT=YES+cb.20210328-17-p0.en+FX+478")
 		youtubeCookiesCount++
 	}
 	
 	rawCookieHeader = strings.Join(parts, "; ")
-	fmt.Printf("🍪 Filtered and Loaded %d STRICTLY YouTube Cookies!\n", youtubeCookiesCount)
+	fmt.Printf("🍪 Filtered and Loaded %d STRICTLY YouTube Cookies Successfully out of %d!\n", youtubeCookiesCount, len(rawCookies))
 }
 
+// Extract Video ID from YouTube URL
 func extractVideoID(url string) string {
 	if strings.Contains(url, "v=") {
 		parts := strings.Split(url, "v=")
-		return strings.Split(parts[1], "&")[0]
+		idPart := strings.Split(parts[1], "&")[0]
+		return idPart
 	} else if strings.Contains(url, "youtu.be/") {
 		parts := strings.Split(url, "youtu.be/")
-		return strings.Split(parts[1], "?")[0]
+		idPart := strings.Split(parts[1], "?")[0]
+		return idPart
 	}
 	return url 
 }
@@ -111,11 +119,13 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// STRICT ANDROID HEADERS
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Sec-Ch-Ua-Platform", "\"Android\"")
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
 
+	// Inject 100% accurate raw cookies without Go's strict formatting errors
 	if rawCookieHeader != "" {
 		req.Header.Set("Cookie", rawCookieHeader)
 	}
@@ -137,25 +147,36 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(bodyString, "problem with your cookie settings") {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
-			Message: "Google rejected the cookies.",
+			Message: "Google rejected the cookies. They might be expired or invalid.",
 			RawData: bodyString, 
 		})
 		return
 	}
 
+	// ---> NEW SMART REGEX FOR i.html STYLE RESPONSE <---
 	re := regexp.MustCompile(`(?s)ytInitialPlayerResponse\s*=\s*(\{.+?\});(?:var\s|</script>)`)
 	match := re.FindStringSubmatch(bodyString)
 	if len(match) < 2 {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
-			Message: "Video JSON data not found.",
+			Message: "Video JSON data not found in HTML. Check raw_data for full HTML.",
+			RawData: bodyString, 
 		})
 		return
 	}
 
 	var playerData map[string]interface{}
-	json.Unmarshal([]byte(match[1]), &playerData)
+	err = json.Unmarshal([]byte(match[1]), &playerData)
+	if err != nil {
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  "error", 
+			Message: "Failed to parse YouTube's JSON data. Raw JSON in raw_data.",
+			RawData: match[1],
+		})
+		return
+	}
 
+	// Check Playability
 	playability, _ := playerData["playabilityStatus"].(map[string]interface{})
 	status, _ := playability["status"].(string)
 	if status != "OK" {
@@ -163,20 +184,25 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(APIResponse{
 			Status:  "error", 
 			Message: "Playability Error: " + reason,
+			RawData: match[1],
 		})
 		return
 	}
 
+	// Extract Streaming Data
 	streamingData, ok := playerData["streamingData"].(map[string]interface{})
 	if !ok {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "No streamingData object found."})
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  "error", 
+			Message: "No streamingData object found.",
+			RawData: match[1],
+		})
 		return
 	}
 
 	var extractedFormats []VideoFormat
-	var targetDownloadURL string
 
-	processFormatList := func(formatList interface{}, isCombined bool) {
+	processFormatList := func(formatList interface{}) {
 		formats, ok := formatList.([]interface{})
 		if !ok { return }
 		for _, f := range formats {
@@ -194,73 +220,34 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 					MimeType: strings.Split(mime, ";")[0],
 					URL:      url,
 				})
-				// Sab se choti combined video (jis me audio+video dono hon) download karne ke liye save kar lo
-				if isCombined && targetDownloadURL == "" {
-					targetDownloadURL = url
-				}
 			}
 		}
 	}
 
-	// Pehle 'formats' (combined audio/video) process karo, phir 'adaptive'
-	processFormatList(streamingData["formats"], true)
-	processFormatList(streamingData["adaptiveFormats"], false)
+	processFormatList(streamingData["formats"])
+	processFormatList(streamingData["adaptiveFormats"])
 
 	if len(extractedFormats) == 0 {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Could not find direct URLs."})
+		json.NewEncoder(w).Encode(APIResponse{
+			Status:  "error", 
+			Message: "Could not find direct URLs. Video might be using Cipher protection. Check raw_data for cipher check.",
+			RawData: match[1],
+		})
 		return
 	}
 
-	// Agar combine format nahi mila to jo pehla link mile wahi utha lo
-	if targetDownloadURL == "" {
-		targetDownloadURL = extractedFormats[0].URL
-	}
-
-	// ---> START SERVER-SIDE DOWNLOADING <---
-	fmt.Println("⏳ Downloading smallest video chunk to server...")
-	os.MkdirAll("downloads", os.ModePerm) // Downloads folder create karega
-	fileName := videoID + ".mp4"
-	filePath := "downloads/" + fileName
-
-	dlReq, _ := http.NewRequest("GET", targetDownloadURL, nil)
-	dlReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	
-	dlClient := &http.Client{Timeout: 60 * time.Second} // Max 60 sec wait karega download ka
-	dlResp, err := dlClient.Do(dlReq)
-	
-	localDownloadURL := ""
-	if err == nil && dlResp.StatusCode == 200 {
-		defer dlResp.Body.Close()
-		outFile, err := os.Create(filePath)
-		if err == nil {
-			io.Copy(outFile, dlResp.Body)
-			outFile.Close()
-			fmt.Println("✅ Video downloaded successfully:", fileName)
-			// Local URL generate kar raha hai (e.g. http://localhost:8080/downloads/video_id.mp4)
-			localDownloadURL = fmt.Sprintf("http://%s/downloads/%s", r.Host, fileName)
-		}
-	} else {
-		fmt.Println("❌ Failed to download video to server.")
-	}
-	// ----------------------------------------
-
-	// Send Final Success Response
+	// Final Success
 	json.NewEncoder(w).Encode(APIResponse{
-		Status:        "success",
-		VideoID:       videoID,
-		DownloadedURL: localDownloadURL, // Seedha server ka direct link!
-		Formats:       extractedFormats,
+		Status:  "success",
+		VideoID: videoID,
+		Formats: extractedFormats,
 	})
 }
 
 func main() {
 	loadCookies("youtube_cookies.json")
 
-	// Routes
 	http.HandleFunc("/api/download", downloadHandler)
-	
-	// Naya route banaya hai jo downloads folder ki files serve karega
-	http.Handle("/downloads/", http.StripPrefix("/downloads/", http.FileServer(http.Dir("downloads"))))
 
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }
