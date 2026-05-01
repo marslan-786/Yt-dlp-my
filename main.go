@@ -14,9 +14,12 @@ import (
 
 // YTDLP JSON کو پارس کرنے کے لیے سٹرکچرز
 type YTDLPFormat struct {
-	Language string `json:"language"`
-	Vcodec   string `json:"vcodec"`
-	Acodec   string `json:"acodec"`
+	FormatID   string `json:"format_id"`
+	Ext        string `json:"ext"`
+	Language   string `json:"language"`
+	Resolution string `json:"resolution"`
+	Vcodec     string `json:"vcodec"`
+	Acodec     string `json:"acodec"`
 }
 
 type YTDLPInfo struct {
@@ -34,17 +37,14 @@ type APIResponse struct {
 }
 
 const downloadsDir = "./downloads"
-const cookiesFile = "cookies.txt" // 🔥 آپ کی کوکیز فائل کا نام
+const cookiesFile = "cookies.txt" 
 
 func main() {
-	// سرور سٹارٹ ہونے سے پہلے ڈاؤن لوڈز کا فولڈر بنا لیں
 	os.MkdirAll(downloadsDir, os.ModePerm)
 
-	// API اور HTML روٹس
 	http.HandleFunc("/", serveHTML)
 	http.HandleFunc("/api/process", processVideo)
 
-	// ویڈیوز کو ڈائریکٹ سرو کرنے کے لیے Static File Server
 	http.Handle("/downloads/", http.StripPrefix("/downloads/", http.FileServer(http.Dir(downloadsDir))))
 
 	fmt.Println("🚀 Server running on http://localhost:8080")
@@ -66,7 +66,7 @@ func serveHTML(w http.ResponseWriter, r *http.Request) {
 			button { width: 95%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; font-weight: bold; }
 			button:disabled { background: #555; cursor: not-allowed; }
 			#downloadBtn { display: none; background: #28a745; margin-top: 10px; text-decoration: none; padding: 12px; border-radius: 5px; color: white; font-weight: bold; }
-			.console { margin-top: 20px; background: #000; color: #0f0; padding: 15px; border-radius: 5px; text-align: left; font-family: monospace; font-size: 14px; min-height: 50px; white-space: pre-wrap; display: none; border: 1px solid #333; overflow-x: auto; }
+			.console { margin-top: 20px; background: #000; color: #0f0; padding: 15px; border-radius: 5px; text-align: left; font-family: monospace; font-size: 14px; min-height: 50px; white-space: pre-wrap; display: none; border: 1px solid #333; overflow-x: auto; max-height: 300px; overflow-y: auto;}
 			.error-text { color: #ff4c4c; }
 		</style>
 	</head>
@@ -88,7 +88,7 @@ func serveHTML(w http.ResponseWriter, r *http.Request) {
 			function logMsg(msg, isError = false) {
 				consoleBox.style.display = "block";
 				if(isError) {
-					consoleBox.innerHTML += "<span class='error-text'>[ERROR] " + msg + "</span><br><br>";
+					consoleBox.innerHTML += "<span class='error-text'>[ERROR]\n" + msg + "</span><br><br>";
 				} else {
 					consoleBox.innerHTML += "[INFO] " + msg + "<br>";
 				}
@@ -103,7 +103,7 @@ func serveHTML(w http.ResponseWriter, r *http.Request) {
 				startBtn.innerText = "Processing...";
 				downloadBtn.style.display = "none";
 				consoleBox.innerHTML = "";
-				logMsg("Fetching video details to check languages...");
+				logMsg("Fetching video details to check languages & formats...");
 
 				try {
 					const res = await fetch('/api/process', {
@@ -115,6 +115,7 @@ func serveHTML(w http.ResponseWriter, r *http.Request) {
 					const data = await res.json();
 					
 					if (data.status === "success") {
+						logMsg(data.message); // یہ بتائے گا کونسا کلائنٹ کامیاب ہوا
 						logMsg("✅ Video is ready on our server!");
 						startBtn.style.display = "none";
 						downloadBtn.style.display = "block";
@@ -149,60 +150,94 @@ func processVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 📺 TV & WEB CLIENTS: Ensures multi-language tracks are visible and avoids PO Token blocks
-	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-	clientExtractor := "youtube:client=tv,web"
-	langExtractor := "youtube:lang=hi"
+	// ---------------------------------------------------------
+	// 🔥 FALLBACK CONFIGURATIONS (SMART CLIENT ROTATION)
+	// ---------------------------------------------------------
+	clientConfigs := []struct {
+		client string
+		ua     string
+		cookie bool
+	}{
+		{"tv", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", true},
+		{"web", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", true},
+		{"ios", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1", true},
+		{"android,android_creator", "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.90 Mobile Safari/537.36", false}, // Android without cookies
+	}
 
-	// Step 1: ویڈیو کا JSON ڈیٹا نکالنا کوکیز کے ساتھ
-	cmdJSON := exec.Command("yt-dlp",
-		"-J",
-		"--cookies", cookiesFile, // 🔥 Passing cookies to bypass bot detection
-		"--extractor-args", clientExtractor,
-		"--extractor-args", langExtractor,
-		"--user-agent", userAgent,
-		req.URL,
-	)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmdJSON.Stdout = &stdout
-	cmdJSON.Stderr = &stderr
-	err := cmdJSON.Run()
+	var info YTDLPInfo
+	var successfulClient string
+	var successfulUA string
+	var usedCookies bool
+	var lastErr string
+	fetchSuccess := false
 
-	if err != nil {
-		stdErrText := strings.TrimSpace(stderr.String())
-		stdOutText := strings.TrimSpace(stdout.String())
-		goErrText := err.Error()
-
-		var actualError string
-		if stdErrText != "" {
-			actualError = stdErrText
-		} else if stdOutText != "" {
-			actualError = stdOutText
-		} else {
-			actualError = "System Error: " + goErrText 
+	// Step 1: باری باری ہر کلائنٹ کو ٹرائی کرنا
+	for _, cfg := range clientConfigs {
+		args := []string{"-J"}
+		
+		// کوکیز کی شرط
+		if cfg.cookie {
+			args = append(args, "--cookies", cookiesFile)
 		}
+		
+		args = append(args, "--extractor-args", "youtube:client="+cfg.client)
+		args = append(args, "--extractor-args", "youtube:lang=hi")
+		args = append(args, "--user-agent", cfg.ua)
+		args = append(args, req.URL)
 
-		errMsg := fmt.Sprintf("yt-dlp Fetch Error:\n%s", actualError)
+		cmdJSON := exec.Command("yt-dlp", args...)
+		var stdout, stderr bytes.Buffer
+		cmdJSON.Stdout = &stdout
+		cmdJSON.Stderr = &stderr
+		
+		err := cmdJSON.Run()
+
+		if err == nil {
+			errParse := json.Unmarshal(stdout.Bytes(), &info)
+			// اگر JSON ٹھیک پارس ہو جائے اور کم از کم ایک فارمیٹ مل جائے تو لوپ بریک کر دو
+			if errParse == nil && len(info.Formats) > 0 {
+				successfulClient = cfg.client
+				successfulUA = cfg.ua
+				usedCookies = cfg.cookie
+				fetchSuccess = true
+				break
+			}
+		}
+		// آخری ایرر سنبھال کر رکھنا تاکہ اگر سب فیل ہوں تو فرنٹ اینڈ کو دکھایا جا سکے
+		lastErr = strings.TrimSpace(stderr.String())
+	}
+
+	// اگر سارے کلائنٹس فیل ہو جائیں
+	if !fetchSuccess {
+		errMsg := fmt.Sprintf("yt-dlp Fallback Failed. تمام کلائنٹس ناکام ہو گئے۔\nآخری ایرر:\n%s\n\n⚠️ نوٹ: چیک کریں کہ کوکیز کام کر رہی ہیں یا نہیں۔", lastErr)
 		sendJSONResponse(w, "error", errMsg, "")
 		return
 	}
 
-	var info YTDLPInfo
-	json.Unmarshal(stdout.Bytes(), &info)
-
-	// Step 2: ہندی زبان کی موجودگی چیک کرنا
+	// Step 2: ہندی زبان چیک کرنا اور تمام دستیاب فارمیٹس کو لسٹ کرنا
 	languages := make(map[string]bool)
+	var formatList []string
 	hasHindi := false
 
 	for _, format := range info.Formats {
-		if format.Language != "" && format.Language != "null" {
-			langLower := strings.ToLower(format.Language)
-			languages[langLower] = true
-			
-			if strings.Contains(langLower, "hi") || strings.Contains(langLower, "hin") {
-				hasHindi = true
+		if format.Vcodec != "mjpeg" {
+			langDisplay := format.Language
+			if langDisplay == "" || langDisplay == "null" {
+				langDisplay = "unknown"
+			} else {
+				langLower := strings.ToLower(langDisplay)
+				languages[langLower] = true
+				if strings.Contains(langLower, "hi") || strings.Contains(langLower, "hin") {
+					hasHindi = true
+				}
 			}
+
+			resDisplay := format.Resolution
+			if resDisplay == "audio only" || resDisplay == "" {
+				resDisplay = "Audio"
+			}
+			fmtDetail := fmt.Sprintf("- [%s] %s | Ext: %s | Lang: %s", format.FormatID, resDisplay, format.Ext, langDisplay)
+			formatList = append(formatList, fmtDetail)
 		}
 	}
 
@@ -213,10 +248,12 @@ func processVideo(w http.ResponseWriter, r *http.Request) {
 		}
 		langStr := strings.Join(availableLangs, ", ")
 		if langStr == "" {
-			langStr = "No distinct audio tracks found."
+			langStr = "No distinct audio languages found."
 		}
+
+		formatsStr := strings.Join(formatList, "\n")
 		
-		errMsg := fmt.Sprintf("ہندی آڈیو ٹریک نہیں ملا!\nاس ویڈیو میں یہ زبانیں دستیاب ہیں: [ %s ]", langStr)
+		errMsg := fmt.Sprintf("❌ ہندی آڈیو ٹریک نہیں ملا!\n(Passed Client: %s)\n\n🌍 دستیاب زبانیں:\n[ %s ]\n\n📜 دستیاب فارمیٹس کی لسٹ:\n%s", successfulClient, langStr, formatsStr)
 		sendJSONResponse(w, "error", errMsg, "")
 		return
 	}
@@ -229,31 +266,36 @@ func processVideo(w http.ResponseWriter, r *http.Request) {
 	outputTemplate := filepath.Join(targetDir, "%(id)s.%(ext)s")
 	formatString := "bestvideo[height<=360][vcodec^=avc1]+bestaudio[language*=hi]/bestvideo[height<=360][vcodec^=avc1]+bestaudio[language*=hin]"
 
-	// Step 4: ڈاؤن لوڈ کمانڈ رن کرنا کوکیز کے ساتھ
-	cmdDL := exec.Command("yt-dlp",
+	// Step 4: فائنل ڈاؤن لوڈ (وہی کلائنٹ استعمال کرنا جو Step 1 میں کامیاب ہوا تھا)
+	dlArgs := []string{
 		"--no-warnings",
 		"--no-playlist",
 		"--merge-output-format", "mp4",
 		"-f", formatString,
-		"--cookies", cookiesFile, // 🔥 Passing cookies for actual download
-		"--extractor-args", clientExtractor,
-		"--extractor-args", langExtractor,
-		"--user-agent", userAgent,
-		"--postprocessor-args", "ffmpeg:-c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart",
-		"--output", outputTemplate,
-		req.URL,
-	)
+	}
+	
+	if usedCookies {
+		dlArgs = append(dlArgs, "--cookies", cookiesFile)
+	}
+	
+	dlArgs = append(dlArgs, "--extractor-args", "youtube:client="+successfulClient)
+	dlArgs = append(dlArgs, "--extractor-args", "youtube:lang=hi")
+	dlArgs = append(dlArgs, "--user-agent", successfulUA)
+	dlArgs = append(dlArgs, "--postprocessor-args", "ffmpeg:-c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart")
+	dlArgs = append(dlArgs, "--output", outputTemplate)
+	dlArgs = append(dlArgs, req.URL)
+
+	cmdDL := exec.Command("yt-dlp", dlArgs...)
 
 	var dlStderr bytes.Buffer
 	cmdDL.Stderr = &dlStderr
-	err = cmdDL.Run()
+	err := cmdDL.Run()
 
 	if err != nil {
-		sendJSONResponse(w, "error", fmt.Sprintf("Download Failed:\n%s", strings.TrimSpace(dlStderr.String())), "")
+		sendJSONResponse(w, "error", fmt.Sprintf("Download Failed on client '%s':\n%s", successfulClient, strings.TrimSpace(dlStderr.String())), "")
 		return
 	}
 
-	// Step 5: ڈاؤن لوڈ کی گئی فائل کا نام ڈھونڈنا اور لوکل URL بنانا
 	files, _ := os.ReadDir(targetDir)
 	var downloadedFile string
 	for _, f := range files {
@@ -268,11 +310,11 @@ func processVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// فائنل URL
 	finalURL := fmt.Sprintf("/downloads/%s/%s", reqID, downloadedFile)
-
-	// Success! Return final URL
-	sendJSONResponse(w, "success", "Download complete!", finalURL)
+	
+	// فرنٹ اینڈ پر بتانا کہ کونسا کلائنٹ کامیاب رہا تھا
+	successMsg := fmt.Sprintf("Download complete! (Used Client: %s)", successfulClient)
+	sendJSONResponse(w, "success", successMsg, finalURL)
 }
 
 func sendJSONResponse(w http.ResponseWriter, status, msg, url string) {
