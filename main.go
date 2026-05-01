@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // YTDLP JSON کو پارس کرنے کے لیے سٹرکچرز
@@ -34,11 +33,18 @@ type APIResponse struct {
 	URL     string `json:"url,omitempty"`
 }
 
+const downloadsDir = "./downloads"
+
 func main() {
-	// Root روٹ جس پر HTML شو ہوگا
+	// سرور سٹارٹ ہونے سے پہلے ڈاؤن لوڈز کا فولڈر بنا لیں
+	os.MkdirAll(downloadsDir, os.ModePerm)
+
+	// API اور HTML روٹس
 	http.HandleFunc("/", serveHTML)
-	// API روٹ جو پروسیسنگ کرے گا
 	http.HandleFunc("/api/process", processVideo)
+
+	// ویڈیوز کو ڈائریکٹ سرو کرنے کے لیے Static File Server
+	http.Handle("/downloads/", http.StripPrefix("/downloads/", http.FileServer(http.Dir(downloadsDir))))
 
 	fmt.Println("🚀 Server running on http://localhost:8080")
 	http.ListenAndServe(":8080", nil)
@@ -59,7 +65,7 @@ func serveHTML(w http.ResponseWriter, r *http.Request) {
 			button { width: 95%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; font-weight: bold; }
 			button:disabled { background: #555; cursor: not-allowed; }
 			#downloadBtn { display: none; background: #28a745; margin-top: 10px; text-decoration: none; padding: 12px; border-radius: 5px; color: white; font-weight: bold; }
-			.console { margin-top: 20px; background: #000; color: #0f0; padding: 15px; border-radius: 5px; text-align: left; font-family: monospace; font-size: 14px; min-height: 50px; white-space: pre-wrap; display: none; border: 1px solid #333; }
+			.console { margin-top: 20px; background: #000; color: #0f0; padding: 15px; border-radius: 5px; text-align: left; font-family: monospace; font-size: 14px; min-height: 50px; white-space: pre-wrap; display: none; border: 1px solid #333; overflow-x: auto; }
 			.error-text { color: #ff4c4c; }
 		</style>
 	</head>
@@ -81,7 +87,7 @@ func serveHTML(w http.ResponseWriter, r *http.Request) {
 			function logMsg(msg, isError = false) {
 				consoleBox.style.display = "block";
 				if(isError) {
-					consoleBox.innerHTML += "<span class='error-text'>[ERROR] " + msg + "</span><br>";
+					consoleBox.innerHTML += "<span class='error-text'>[ERROR] " + msg + "</span><br><br>";
 				} else {
 					consoleBox.innerHTML += "[INFO] " + msg + "<br>";
 				}
@@ -108,7 +114,7 @@ func serveHTML(w http.ResponseWriter, r *http.Request) {
 					const data = await res.json();
 					
 					if (data.status === "success") {
-						logMsg("✅ Upload complete! URL generated.");
+						logMsg("✅ Video is ready on our server!");
 						startBtn.style.display = "none";
 						downloadBtn.style.display = "block";
 						downloadBtn.href = data.url;
@@ -142,21 +148,33 @@ func processVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 1: ویڈیو کا JSON ڈیٹا نکالنا تاکہ آڈیو ٹریکس چیک کیے جا سکیں
-	cmdJSON := exec.Command("yt-dlp", "-J", req.URL)
+	// 📱 FULL ANDROID HEADERS TO BYPASS PO TOKEN
+	userAgent := "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.90 Mobile Safari/537.36"
+	clientExtractor := "youtube:client=android,android_creator"
+
+	// Step 1: ویڈیو کا JSON ڈیٹا نکالنا (اصل ایرر کیچ کرنے کے ساتھ)
+	cmdJSON := exec.Command("yt-dlp",
+		"-J",
+		"--extractor-args", clientExtractor,
+		"--user-agent", userAgent,
+		req.URL,
+	)
 	var stdout bytes.Buffer
+	var stderr bytes.Buffer
 	cmdJSON.Stdout = &stdout
+	cmdJSON.Stderr = &stderr
 	err := cmdJSON.Run()
 
 	if err != nil {
-		sendJSONResponse(w, "error", "Failed to fetch video info. It might be restricted or invalid.", "")
+		errMsg := fmt.Sprintf("yt-dlp Error fetching info:\n%s", strings.TrimSpace(stderr.String()))
+		sendJSONResponse(w, "error", errMsg, "")
 		return
 	}
 
 	var info YTDLPInfo
 	json.Unmarshal(stdout.Bytes(), &info)
 
-	// Step 2: تمام دستیاب زبانوں کی لسٹ بنانا
+	// Step 2: ہندی زبان کی موجودگی چیک کرنا
 	languages := make(map[string]bool)
 	hasHindi := false
 
@@ -165,14 +183,12 @@ func processVideo(w http.ResponseWriter, r *http.Request) {
 			langLower := strings.ToLower(format.Language)
 			languages[langLower] = true
 			
-			// ہندی چیک کرنا (hi یا hin)
 			if strings.Contains(langLower, "hi") || strings.Contains(langLower, "hin") {
 				hasHindi = true
 			}
 		}
 	}
 
-	// اگر ہندی نہ ملے تو دستیاب زبانوں کی لسٹ ریٹرن کر دو
 	if !hasHindi {
 		var availableLangs []string
 		for lang := range languages {
@@ -183,112 +199,64 @@ func processVideo(w http.ResponseWriter, r *http.Request) {
 			langStr = "No distinct audio tracks found."
 		}
 		
-		errMsg := fmt.Sprintf("❌ ہندی آڈیو ٹریک نہیں ملا!\n\nاس ویڈیو میں یہ زبانیں دستیاب ہیں:\n%s\n\n(اگر آپ کو لگتا ہے کہ ہندی موجود ہے تو وہ یوٹیوب پر کسی اور کوڈ سے سیو ہوگی جو اوپر لسٹ میں ہے۔)", langStr)
+		errMsg := fmt.Sprintf("ہندی آڈیو ٹریک نہیں ملا!\nاس ویڈیو میں یہ زبانیں دستیاب ہیں: [ %s ]", langStr)
 		sendJSONResponse(w, "error", errMsg, "")
 		return
 	}
 
-	// Step 3: اگر ہندی مل گئی تو اب سختی سے ڈاؤن لوڈ کرو
-	tempDir, _ := os.MkdirTemp("", "ytdlp_*")
-	defer os.RemoveAll(tempDir)
+	// Step 3: ڈاؤن لوڈ کے لیے ایک یونیک فولڈر بنانا تاکہ فائلز مکس نہ ہوں
+	reqID := fmt.Sprintf("%d", time.Now().UnixNano())
+	targetDir := filepath.Join(downloadsDir, reqID)
+	os.MkdirAll(targetDir, os.ModePerm)
 
-	outputTemplate := filepath.Join(tempDir, "%(id)s.%(ext)s")
-	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-	// Strictly force Hindi formats
+	outputTemplate := filepath.Join(targetDir, "%(id)s.%(ext)s")
 	formatString := "bestvideo[height<=360][vcodec^=avc1]+bestaudio[language*=hi]/bestvideo[height<=360][vcodec^=avc1]+bestaudio[language*=hin]"
 
+	// Step 4: ڈاؤن لوڈ کمانڈ رن کرنا
 	cmdDL := exec.Command("yt-dlp",
 		"--no-warnings",
 		"--no-playlist",
 		"--merge-output-format", "mp4",
 		"-f", formatString,
+		"--extractor-args", clientExtractor,
 		"--user-agent", userAgent,
 		"--postprocessor-args", "ffmpeg:-c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart",
 		"--output", outputTemplate,
 		req.URL,
 	)
 
-	var stderr bytes.Buffer
-	cmdDL.Stderr = &stderr
+	var dlStderr bytes.Buffer
+	cmdDL.Stderr = &dlStderr
 	err = cmdDL.Run()
 
 	if err != nil {
-		sendJSONResponse(w, "error", fmt.Sprintf("Download Failed:\n%s", stderr.String()), "")
+		sendJSONResponse(w, "error", fmt.Sprintf("Download Failed:\n%s", strings.TrimSpace(dlStderr.String())), "")
 		return
 	}
 
-	// Step 4: فائنل .mp4 فائل ڈھونڈنا اور اپلوڈ کرنا
-	files, _ := os.ReadDir(tempDir)
-	var downloadedPath string
+	// Step 5: ڈاؤن لوڈ کی گئی فائل کا نام ڈھونڈنا اور لوکل URL بنانا
+	files, _ := os.ReadDir(targetDir)
+	var downloadedFile string
 	for _, f := range files {
 		if !f.IsDir() && strings.HasSuffix(strings.ToLower(f.Name()), ".mp4") {
-			downloadedPath = filepath.Join(tempDir, f.Name())
+			downloadedFile = f.Name()
 			break
 		}
 	}
 
-	if downloadedPath == "" {
-		sendJSONResponse(w, "error", "File downloaded but could not be located.", "")
+	if downloadedFile == "" {
+		sendJSONResponse(w, "error", "File downloaded but could not be located on server.", "")
 		return
 	}
 
-	// Step 5: آپ کی کیٹ باکس API پر اپلوڈ کرنا
-	uploadedURL, err := uploadToCatbox(downloadedPath)
-	if err != nil {
-		sendJSONResponse(w, "error", fmt.Sprintf("Upload Failed: %v", err), "")
-		return
-	}
+	// فائنل URL جو سیدھا آپ کے سرور کے /downloads/ فولڈر کو پوائنٹ کرے گا
+	finalURL := fmt.Sprintf("/downloads/%s/%s", reqID, downloadedFile)
 
 	// Success! Return final URL
-	sendJSONResponse(w, "success", "Download and upload complete!", uploadedURL)
+	sendJSONResponse(w, "success", "Download complete!", finalURL)
 }
 
-// JSON رسپانس بھیجنے کا ہیلپر فنکشن
 func sendJSONResponse(w http.ResponseWriter, status, msg, url string) {
 	resp := APIResponse{Status: status, Message: msg, URL: url}
 	json.NewEncoder(w).Encode(resp)
-}
-
-// کیٹ باکس کلون پر اپلوڈ کرنے کا فنکشن
-func uploadToCatbox(filePath string) (string, error) {
-	fileToUpload, err := os.Open(filePath)
-	if err != nil {
-		return "", err
-	}
-	defer fileToUpload.Close()
-
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	_ = writer.WriteField("reqtype", "fileupload")
-	
-	part, err := writer.CreateFormFile("fileToUpload", filepath.Base(filePath))
-	if err == nil {
-		_, _ = io.Copy(part, fileToUpload)
-	}
-	writer.Close()
-
-	req, err := http.NewRequest("POST", "https://catbox-production-6705.up.railway.app/upload", body)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-
-	httpClient := &http.Client{}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("Server returned %d: %s", resp.StatusCode, string(respBytes))
-	}
-
-	return strings.TrimSpace(string(respBytes)), nil
 }
