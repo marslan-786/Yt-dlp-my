@@ -22,7 +22,7 @@ RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o 
 
 # Copy the compiled Go binary from the builder stage
 COPY --from=builder /app/downloader-api .
-
+COPY cookies.txt ./cookies.txt
 # Create the downloads directory and give it read/write permissions
 RUN mkdir -p downloads && chmod 777 downloads
 
