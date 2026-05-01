@@ -34,6 +34,7 @@ type APIResponse struct {
 }
 
 const downloadsDir = "./downloads"
+const cookiesFile = "cookies.txt" // 🔥 آپ کی کوکیز فائل کا نام
 
 func main() {
 	// سرور سٹارٹ ہونے سے پہلے ڈاؤن لوڈز کا فولڈر بنا لیں
@@ -148,14 +149,17 @@ func processVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 📱 FULL ANDROID HEADERS TO BYPASS PO TOKEN
-	userAgent := "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.90 Mobile Safari/537.36"
-	clientExtractor := "youtube:client=android,android_creator"
+	// 📺 TV & WEB CLIENTS: Ensures multi-language tracks are visible and avoids PO Token blocks
+	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+	clientExtractor := "youtube:client=tv,web"
+	langExtractor := "youtube:lang=hi"
 
-	// Step 1: ویڈیو کا JSON ڈیٹا نکالنا (اصل ایرر کیچ کرنے کے ساتھ)
+	// Step 1: ویڈیو کا JSON ڈیٹا نکالنا کوکیز کے ساتھ
 	cmdJSON := exec.Command("yt-dlp",
 		"-J",
+		"--cookies", cookiesFile, // 🔥 Passing cookies to bypass bot detection
 		"--extractor-args", clientExtractor,
+		"--extractor-args", langExtractor,
 		"--user-agent", userAgent,
 		req.URL,
 	)
@@ -166,7 +170,20 @@ func processVideo(w http.ResponseWriter, r *http.Request) {
 	err := cmdJSON.Run()
 
 	if err != nil {
-		errMsg := fmt.Sprintf("yt-dlp Error fetching info:\n%s", strings.TrimSpace(stderr.String()))
+		stdErrText := strings.TrimSpace(stderr.String())
+		stdOutText := strings.TrimSpace(stdout.String())
+		goErrText := err.Error()
+
+		var actualError string
+		if stdErrText != "" {
+			actualError = stdErrText
+		} else if stdOutText != "" {
+			actualError = stdOutText
+		} else {
+			actualError = "System Error: " + goErrText 
+		}
+
+		errMsg := fmt.Sprintf("yt-dlp Fetch Error:\n%s", actualError)
 		sendJSONResponse(w, "error", errMsg, "")
 		return
 	}
@@ -204,7 +221,7 @@ func processVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 3: ڈاؤن لوڈ کے لیے ایک یونیک فولڈر بنانا تاکہ فائلز مکس نہ ہوں
+	// Step 3: ڈاؤن لوڈ کے لیے ایک یونیک فولڈر بنانا
 	reqID := fmt.Sprintf("%d", time.Now().UnixNano())
 	targetDir := filepath.Join(downloadsDir, reqID)
 	os.MkdirAll(targetDir, os.ModePerm)
@@ -212,13 +229,15 @@ func processVideo(w http.ResponseWriter, r *http.Request) {
 	outputTemplate := filepath.Join(targetDir, "%(id)s.%(ext)s")
 	formatString := "bestvideo[height<=360][vcodec^=avc1]+bestaudio[language*=hi]/bestvideo[height<=360][vcodec^=avc1]+bestaudio[language*=hin]"
 
-	// Step 4: ڈاؤن لوڈ کمانڈ رن کرنا
+	// Step 4: ڈاؤن لوڈ کمانڈ رن کرنا کوکیز کے ساتھ
 	cmdDL := exec.Command("yt-dlp",
 		"--no-warnings",
 		"--no-playlist",
 		"--merge-output-format", "mp4",
 		"-f", formatString,
+		"--cookies", cookiesFile, // 🔥 Passing cookies for actual download
 		"--extractor-args", clientExtractor,
+		"--extractor-args", langExtractor,
 		"--user-agent", userAgent,
 		"--postprocessor-args", "ffmpeg:-c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart",
 		"--output", outputTemplate,
@@ -249,7 +268,7 @@ func processVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// فائنل URL جو سیدھا آپ کے سرور کے /downloads/ فولڈر کو پوائنٹ کرے گا
+	// فائنل URL
 	finalURL := fmt.Sprintf("/downloads/%s/%s", reqID, downloadedFile)
 
 	// Success! Return final URL
