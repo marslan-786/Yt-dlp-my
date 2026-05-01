@@ -1,260 +1,294 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
-	"regexp"
+	"os/exec"
+	"path/filepath"
 	"strings"
-	"time"
 )
 
-// --- Cookie Structs ---
-type CookieJSON struct {
-	Name   string `json:"name"`
-	Value  string `json:"value"`
-	Domain string `json:"domain"`
-	Path   string `json:"path"`
+// YTDLP JSON کو پارس کرنے کے لیے سٹرکچرز
+type YTDLPFormat struct {
+	Language string `json:"language"`
+	Vcodec   string `json:"vcodec"`
+	Acodec   string `json:"acodec"`
 }
 
-// --- Response Structs ---
-type VideoFormat struct {
-	Quality  string `json:"quality"`
-	MimeType string `json:"mimeType"`
-	URL      string `json:"url"`
+type YTDLPInfo struct {
+	Formats []YTDLPFormat `json:"formats"`
+}
+
+type APIRequest struct {
+	URL string `json:"url"`
 }
 
 type APIResponse struct {
-	Status  string        `json:"status"`
-	VideoID string        `json:"video_id,omitempty"`
-	Formats []VideoFormat `json:"formats,omitempty"`
-	Message string        `json:"message,omitempty"`
-	RawData string        `json:"raw_data,omitempty"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	URL     string `json:"url,omitempty"`
 }
 
-// Global raw cookie string
-var rawCookieHeader string
+func main() {
+	// Root روٹ جس پر HTML شو ہوگا
+	http.HandleFunc("/", serveHTML)
+	// API روٹ جو پروسیسنگ کرے گا
+	http.HandleFunc("/api/process", processVideo)
 
-// Load cookies from JSON file
-func loadCookies(filename string) {
-	file, err := os.Open(filename)
-	if err != nil {
-		fmt.Println("⚠️ Cookies file not found:", err)
-		return
-	}
-	defer file.Close()
-
-	var rawCookies []CookieJSON
-	err = json.NewDecoder(file).Decode(&rawCookies)
-	if err != nil {
-		fmt.Println("⚠️ Error decoding cookies:", err)
-		return
-	}
-
-	var parts []string
-	hasConsent := false
-	youtubeCookiesCount := 0
-
-	for _, c := range rawCookies {
-		// ---> THE MAGIC FIX: FILTER GARBAGE COOKIES <---
-		if !strings.Contains(c.Domain, "youtube.com") {
-			continue
-		}
-
-		// Newlines remove kar rahe hain magar double quotes (") ko mehfooz rakha hai
-		cleanValue := strings.ReplaceAll(c.Value, "\n", "")
-		cleanValue := strings.ReplaceAll(cleanValue, "\r", "")
-		parts = append(parts, fmt.Sprintf("%s=%s", c.Name, cleanValue))
-		
-		youtubeCookiesCount++
-
-		if strings.ToUpper(c.Name) == "CONSENT" {
-			hasConsent = true
-		}
-	}
-	
-	// CONSENT cookie auto-add taake Youtube terms wala page bypass ho
-	if !hasConsent {
-		parts = append(parts, "CONSENT=YES+cb.20210328-17-p0.en+FX+478")
-		youtubeCookiesCount++
-	}
-	
-	rawCookieHeader = strings.Join(parts, "; ")
-	fmt.Printf("🍪 Filtered and Loaded %d STRICTLY YouTube Cookies Successfully out of %d!\n", youtubeCookiesCount, len(rawCookies))
+	fmt.Println("🚀 Server running on http://localhost:8080")
+	http.ListenAndServe(":8080", nil)
 }
 
-// Extract Video ID from YouTube URL
-func extractVideoID(url string) string {
-	if strings.Contains(url, "v=") {
-		parts := strings.Split(url, "v=")
-		idPart := strings.Split(parts[1], "&")[0]
-		return idPart
-	} else if strings.Contains(url, "youtu.be/") {
-		parts := strings.Split(url, "youtu.be/")
-		idPart := strings.Split(parts[1], "?")[0]
-		return idPart
-	}
-	return url 
+func serveHTML(w http.ResponseWriter, r *http.Request) {
+	html := `
+	<!DOCTYPE html>
+	<html lang="en">
+	<head>
+		<meta charset="UTF-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0">
+		<title>YouTube Hindi Downloader API</title>
+		<style>
+			body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; padding: 50px; }
+			.container { max-width: 500px; margin: 0 auto; background: #1e1e1e; padding: 30px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+			input { width: 90%; padding: 12px; margin-bottom: 20px; border: 1px solid #333; border-radius: 5px; background: #2a2a2a; color: white; }
+			button { width: 95%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; font-weight: bold; }
+			button:disabled { background: #555; cursor: not-allowed; }
+			#downloadBtn { display: none; background: #28a745; margin-top: 10px; text-decoration: none; padding: 12px; border-radius: 5px; color: white; font-weight: bold; }
+			.console { margin-top: 20px; background: #000; color: #0f0; padding: 15px; border-radius: 5px; text-align: left; font-family: monospace; font-size: 14px; min-height: 50px; white-space: pre-wrap; display: none; border: 1px solid #333; }
+			.error-text { color: #ff4c4c; }
+		</style>
+	</head>
+	<body>
+		<div class="container">
+			<h2>🎥 Hindi Video Fetcher</h2>
+			<input type="text" id="urlInput" placeholder="Enter YouTube URL here...">
+			<button id="startBtn">Start Processing</button>
+			<a href="#" id="downloadBtn" target="_blank">⬇️ Download Video</a>
+			<div id="consoleBox" class="console"></div>
+		</div>
+
+		<script>
+			const startBtn = document.getElementById('startBtn');
+			const downloadBtn = document.getElementById('downloadBtn');
+			const consoleBox = document.getElementById('consoleBox');
+			const urlInput = document.getElementById('urlInput');
+
+			function logMsg(msg, isError = false) {
+				consoleBox.style.display = "block";
+				if(isError) {
+					consoleBox.innerHTML += "<span class='error-text'>[ERROR] " + msg + "</span><br>";
+				} else {
+					consoleBox.innerHTML += "[INFO] " + msg + "<br>";
+				}
+				consoleBox.scrollTop = consoleBox.scrollHeight;
+			}
+
+			startBtn.addEventListener('click', async () => {
+				const url = urlInput.value.trim();
+				if(!url) return alert("Please enter a link!");
+
+				startBtn.disabled = true;
+				startBtn.innerText = "Processing...";
+				downloadBtn.style.display = "none";
+				consoleBox.innerHTML = "";
+				logMsg("Fetching video details to check languages...");
+
+				try {
+					const res = await fetch('/api/process', {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({ url: url })
+					});
+					
+					const data = await res.json();
+					
+					if (data.status === "success") {
+						logMsg("✅ Upload complete! URL generated.");
+						startBtn.style.display = "none";
+						downloadBtn.style.display = "block";
+						downloadBtn.href = data.url;
+					} else {
+						logMsg(data.message, true);
+						startBtn.disabled = false;
+						startBtn.innerText = "Start Processing";
+					}
+				} catch (err) {
+					logMsg(err.message, true);
+					startBtn.disabled = false;
+					startBtn.innerText = "Start Processing";
+				}
+			});
+		</script>
+	</body>
+	</html>
+	`
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(html))
 }
 
-// Main API Handler
-func downloadHandler(w http.ResponseWriter, r *http.Request) {
+func processVideo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	videoURL := r.URL.Query().Get("url")
-	if videoURL == "" {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "URL parameter is missing"})
+	var req APIRequest
+	json.NewDecoder(r.Body).Decode(&req)
+
+	if req.URL == "" {
+		sendJSONResponse(w, "error", "URL is missing!", "")
 		return
 	}
 
-	videoID := extractVideoID(videoURL)
-	targetURL := "https://m.youtube.com/watch?v=" + videoID
+	// Step 1: ویڈیو کا JSON ڈیٹا نکالنا تاکہ آڈیو ٹریکس چیک کیے جا سکیں
+	cmdJSON := exec.Command("yt-dlp", "-J", req.URL)
+	var stdout bytes.Buffer
+	cmdJSON.Stdout = &stdout
+	err := cmdJSON.Run()
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Failed to create request"})
+		sendJSONResponse(w, "error", "Failed to fetch video info. It might be restricted or invalid.", "")
 		return
 	}
 
-	// STRICT ANDROID HEADERS
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Sec-Ch-Ua-Platform", "\"Android\"")
-	req.Header.Set("Sec-Ch-Ua-Mobile", "?1")
+	var info YTDLPInfo
+	json.Unmarshal(stdout.Bytes(), &info)
 
-	// Inject 100% accurate raw cookies without Go's strict formatting errors
-	if rawCookieHeader != "" {
-		req.Header.Set("Cookie", rawCookieHeader)
-	}
+	// Step 2: تمام دستیاب زبانوں کی لسٹ بنانا
+	languages := make(map[string]bool)
+	hasHindi := false
 
-	resp, err := client.Do(req)
-	if err != nil {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Failed to fetch video page"})
-		return
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Failed to read response"})
-		return
-	}
-	bodyString := string(bodyBytes)
-
-	if strings.Contains(bodyString, "problem with your cookie settings") {
-		json.NewEncoder(w).Encode(APIResponse{
-			Status:  "error", 
-			Message: "Google rejected the cookies. They might be expired or invalid.",
-			RawData: bodyString, 
-		})
-		return
-	}
-
-	// ---> NEW SMART REGEX FOR i.html STYLE RESPONSE <---
-	re := regexp.MustCompile(`(?s)ytInitialPlayerResponse\s*=\s*(\{.+?\});(?:var\s|</script>)`)
-	match := re.FindStringSubmatch(bodyString)
-	if len(match) < 2 {
-		json.NewEncoder(w).Encode(APIResponse{
-			Status:  "error", 
-			Message: "Video JSON data not found in HTML. Check raw_data for full HTML.",
-			RawData: bodyString, 
-		})
-		return
-	}
-
-	var playerData map[string]interface{}
-	err = json.Unmarshal([]byte(match[1]), &playerData)
-	if err != nil {
-		json.NewEncoder(w).Encode(APIResponse{
-			Status:  "error", 
-			Message: "Failed to parse YouTube's JSON data. Raw JSON in raw_data.",
-			RawData: match[1],
-		})
-		return
-	}
-
-	// Check Playability
-	playability, _ := playerData["playabilityStatus"].(map[string]interface{})
-	status, _ := playability["status"].(string)
-	if status != "OK" {
-		reason, _ := playability["reason"].(string)
-		json.NewEncoder(w).Encode(APIResponse{
-			Status:  "error", 
-			Message: "Playability Error: " + reason,
-			RawData: match[1],
-		})
-		return
-	}
-
-	// Extract Streaming Data
-	streamingData, ok := playerData["streamingData"].(map[string]interface{})
-	if !ok {
-		json.NewEncoder(w).Encode(APIResponse{
-			Status:  "error", 
-			Message: "No streamingData object found.",
-			RawData: match[1],
-		})
-		return
-	}
-
-	var extractedFormats []VideoFormat
-
-	processFormatList := func(formatList interface{}) {
-		formats, ok := formatList.([]interface{})
-		if !ok { return }
-		for _, f := range formats {
-			fmtData, ok := f.(map[string]interface{})
-			if !ok { continue }
+	for _, format := range info.Formats {
+		if format.Language != "" && format.Language != "null" {
+			langLower := strings.ToLower(format.Language)
+			languages[langLower] = true
 			
-			quality, _ := fmtData["qualityLabel"].(string)
-			if quality == "" { quality = "Audio Only" }
-			mime, _ := fmtData["mimeType"].(string)
-			url, _ := fmtData["url"].(string)
-
-			if url != "" {
-				extractedFormats = append(extractedFormats, VideoFormat{
-					Quality:  quality,
-					MimeType: strings.Split(mime, ";")[0],
-					URL:      url,
-				})
+			// ہندی چیک کرنا (hi یا hin)
+			if strings.Contains(langLower, "hi") || strings.Contains(langLower, "hin") {
+				hasHindi = true
 			}
 		}
 	}
 
-	processFormatList(streamingData["formats"])
-	processFormatList(streamingData["adaptiveFormats"])
-
-	if len(extractedFormats) == 0 {
-		json.NewEncoder(w).Encode(APIResponse{
-			Status:  "error", 
-			Message: "Could not find direct URLs. Video might be using Cipher protection. Check raw_data for cipher check.",
-			RawData: match[1],
-		})
+	// اگر ہندی نہ ملے تو دستیاب زبانوں کی لسٹ ریٹرن کر دو
+	if !hasHindi {
+		var availableLangs []string
+		for lang := range languages {
+			availableLangs = append(availableLangs, lang)
+		}
+		langStr := strings.Join(availableLangs, ", ")
+		if langStr == "" {
+			langStr = "No distinct audio tracks found."
+		}
+		
+		errMsg := fmt.Sprintf("❌ ہندی آڈیو ٹریک نہیں ملا!\n\nاس ویڈیو میں یہ زبانیں دستیاب ہیں:\n%s\n\n(اگر آپ کو لگتا ہے کہ ہندی موجود ہے تو وہ یوٹیوب پر کسی اور کوڈ سے سیو ہوگی جو اوپر لسٹ میں ہے۔)", langStr)
+		sendJSONResponse(w, "error", errMsg, "")
 		return
 	}
 
-	// Final Success
-	json.NewEncoder(w).Encode(APIResponse{
-		Status:  "success",
-		VideoID: videoID,
-		Formats: extractedFormats,
-	})
+	// Step 3: اگر ہندی مل گئی تو اب سختی سے ڈاؤن لوڈ کرو
+	tempDir, _ := os.MkdirTemp("", "ytdlp_*")
+	defer os.RemoveAll(tempDir)
+
+	outputTemplate := filepath.Join(tempDir, "%(id)s.%(ext)s")
+	userAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+	// Strictly force Hindi formats
+	formatString := "bestvideo[height<=360][vcodec^=avc1]+bestaudio[language*=hi]/bestvideo[height<=360][vcodec^=avc1]+bestaudio[language*=hin]"
+
+	cmdDL := exec.Command("yt-dlp",
+		"--no-warnings",
+		"--no-playlist",
+		"--merge-output-format", "mp4",
+		"-f", formatString,
+		"--user-agent", userAgent,
+		"--postprocessor-args", "ffmpeg:-c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart",
+		"--output", outputTemplate,
+		req.URL,
+	)
+
+	var stderr bytes.Buffer
+	cmdDL.Stderr = &stderr
+	err = cmdDL.Run()
+
+	if err != nil {
+		sendJSONResponse(w, "error", fmt.Sprintf("Download Failed:\n%s", stderr.String()), "")
+		return
+	}
+
+	// Step 4: فائنل .mp4 فائل ڈھونڈنا اور اپلوڈ کرنا
+	files, _ := os.ReadDir(tempDir)
+	var downloadedPath string
+	for _, f := range files {
+		if !f.IsDir() && strings.HasSuffix(strings.ToLower(f.Name()), ".mp4") {
+			downloadedPath = filepath.Join(tempDir, f.Name())
+			break
+		}
+	}
+
+	if downloadedPath == "" {
+		sendJSONResponse(w, "error", "File downloaded but could not be located.", "")
+		return
+	}
+
+	// Step 5: آپ کی کیٹ باکس API پر اپلوڈ کرنا
+	uploadedURL, err := uploadToCatbox(downloadedPath)
+	if err != nil {
+		sendJSONResponse(w, "error", fmt.Sprintf("Upload Failed: %v", err), "")
+		return
+	}
+
+	// Success! Return final URL
+	sendJSONResponse(w, "success", "Download and upload complete!", uploadedURL)
 }
 
-func main() {
-	loadCookies("youtube_cookies.json")
+// JSON رسپانس بھیجنے کا ہیلپر فنکشن
+func sendJSONResponse(w http.ResponseWriter, status, msg, url string) {
+	resp := APIResponse{Status: status, Message: msg, URL: url}
+	json.NewEncoder(w).Encode(resp)
+}
 
-	http.HandleFunc("/api/download", downloadHandler)
-
-	port := os.Getenv("PORT")
-	if port == "" { port = "8080" }
-
-	fmt.Println("🚀 Go API Server running on port", port)
-	err := http.ListenAndServe(":"+port, nil)
+// کیٹ باکس کلون پر اپلوڈ کرنے کا فنکشن
+func uploadToCatbox(filePath string) (string, error) {
+	fileToUpload, err := os.Open(filePath)
 	if err != nil {
-		fmt.Println("Server Error:", err)
+		return "", err
 	}
+	defer fileToUpload.Close()
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	_ = writer.WriteField("reqtype", "fileupload")
+	
+	part, err := writer.CreateFormFile("fileToUpload", filepath.Base(filePath))
+	if err == nil {
+		_, _ = io.Copy(part, fileToUpload)
+	}
+	writer.Close()
+
+	req, err := http.NewRequest("POST", "https://catbox-production-6705.up.railway.app/upload", body)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	httpClient := &http.Client{}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Server returned %d: %s", resp.StatusCode, string(respBytes))
+	}
+
+	return strings.TrimSpace(string(respBytes)), nil
 }
