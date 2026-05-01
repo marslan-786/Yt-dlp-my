@@ -5,16 +5,16 @@ WORKDIR /app
 # Copy the Go code
 COPY main.go .
 
-# Build the Go binary (since we only use standard libraries, go mod isn't strictly required here)
+# Build the Go binary
 RUN go build -o downloader-api main.go
 
 # Step 2: Create the final lightweight production image
 FROM alpine:latest
 WORKDIR /app
 
-# Install dependencies: Python (required for yt-dlp), FFmpeg (for formatting), and curl
+# 🔥 Added nodejs for yt-dlp JavaScript execution
 RUN apk update && \
-    apk add --no-cache python3 ffmpeg curl
+    apk add --no-cache python3 ffmpeg curl nodejs
 
 # Download the latest yt-dlp binary and make it executable
 RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
